@@ -390,34 +390,44 @@ async function handleLogout() {
 async function handlePause() {
   const taskId = scanStore.taskId
   if (!taskId) return
+  // Optimistically mark as paused so the UI switches to "继续" immediately.
+  scanStore.setPaused(true)
   try {
     await pauseScan(taskId)
-    scanStore.setPaused(true)
   } catch {
-    // ignore
+    // Revert if the request failed
+    scanStore.setPaused(false)
   }
 }
 
 async function handleResume() {
   const taskId = scanStore.taskId
   if (!taskId) return
+  scanStore.setPaused(false)
   try {
     await resumeScan(taskId)
-    scanStore.setPaused(false)
   } catch {
-    // ignore
+    // Revert if the request failed
+    scanStore.setPaused(true)
   }
 }
 
 async function handleStop() {
   const taskId = scanStore.taskId
   if (!taskId) return
+  // Optimistically update UI immediately so the button disappears and
+  // repeated clicks are prevented, even if the SSE 'stopped' event is delayed.
+  scanStore.setScanning(false)
+  scanStore.setPaused(false)
+  scanStore.setTaskId(null)
+  showProgress.value = false
   try {
     await stopScan(taskId)
-    scanStore.setPaused(false)
-    // The 'stopped' SSE event will handle the rest
+    // The 'stopped' SSE event will arrive shortly and update groups/results.
+    // If it doesn't (e.g. connection already closed), partial results already
+    // in the store from the last 'progress' event are still shown.
   } catch {
-    // ignore
+    // 404 means the task already finished — that's fine, ignore.
   }
 }
 

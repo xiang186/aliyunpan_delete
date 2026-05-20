@@ -118,8 +118,8 @@ async def pause_scan(
     task_id: str,
     scan_service: ScanService = Depends(get_scan_service),
 ) -> JSONResponse:
-    from app.services.scan_service import _scan_running
-    if task_id not in _scan_running:
+    from app.services.scan_service import _scan_queues, _scan_running
+    if task_id not in _scan_running and task_id not in _scan_queues:
         raise HTTPException(status_code=404, detail=f"Scan task '{task_id}' not found.")
     scan_service.pause_scan(task_id)
     return JSONResponse(content={"status": "paused"})
@@ -130,8 +130,8 @@ async def resume_scan(
     task_id: str,
     scan_service: ScanService = Depends(get_scan_service),
 ) -> JSONResponse:
-    from app.services.scan_service import _scan_running
-    if task_id not in _scan_running:
+    from app.services.scan_service import _scan_queues, _scan_running
+    if task_id not in _scan_running and task_id not in _scan_queues:
         raise HTTPException(status_code=404, detail=f"Scan task '{task_id}' not found.")
     scan_service.resume_scan(task_id)
     return JSONResponse(content={"status": "resumed"})
@@ -142,8 +142,12 @@ async def stop_scan(
     task_id: str,
     scan_service: ScanService = Depends(get_scan_service),
 ) -> JSONResponse:
-    from app.services.scan_service import _scan_running
-    if task_id not in _scan_running:
+    from app.services.scan_service import _scan_queues, _scan_running, _scan_stop_flags
+    # If the task is already stopped/finished, return 200 (idempotent)
+    if task_id not in _scan_running and task_id not in _scan_queues:
+        # Check if a stop was already requested (race: stop flag set but finally not yet run)
+        if _scan_stop_flags.get(task_id):
+            return JSONResponse(content={"status": "stopping"})
         raise HTTPException(status_code=404, detail=f"Scan task '{task_id}' not found.")
     scan_service.stop_scan(task_id)
     return JSONResponse(content={"status": "stopping"})

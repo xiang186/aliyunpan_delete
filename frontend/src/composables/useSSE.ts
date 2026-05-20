@@ -76,7 +76,7 @@ export function useSSE() {
         const msgEvent = e as MessageEvent
         try {
           const data = JSON.parse(msgEvent.data)
-          if (eventType === 'complete' || eventType === 'error') {
+          if (eventType === 'complete' || eventType === 'error' || eventType === 'stopped') {
             terminalEventReceived = true
           }
           handler(data)
