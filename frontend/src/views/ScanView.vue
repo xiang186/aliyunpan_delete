@@ -15,8 +15,27 @@
     <el-main class="main-content">
       <!-- 扫描按钮 -->
       <div class="scan-controls">
-        <el-button type="primary" :loading="scanStore.isScanning && !scanStore.isPaused" @click="handleScan" :disabled="scanStore.isScanning">
+        <el-button type="primary" :loading="scanStore.isScanning && !scanStore.isPaused" @click="() => handleScan()" :disabled="scanStore.isScanning">
           {{ scanStore.isScanning ? '扫描中...' : '扫描重复文件' }}
+        </el-button>
+        <el-button :icon="Folder" @click="showFolderDialog = true" :disabled="scanStore.isScanning">
+          选择目录
+        </el-button>
+        <el-button
+          :icon="Refresh"
+          @click="() => handleScan(true)"
+          :disabled="scanStore.isScanning"
+          title="跳过未变更目录，只扫描新增或变更的部分"
+        >
+          增量扫描
+        </el-button>
+        <el-button
+          :icon="Delete"
+          @click="handleClearScanCache"
+          :disabled="scanStore.isScanning"
+          title="清除增量扫描缓存，下次扫描将重新全量遍历所有目录"
+        >
+          清除扫描缓存
         </el-button>
         <template v-if="scanStore.isScanning && scanStore.taskId">
           <el-button v-if="!scanStore.isPaused" @click="handlePause">
@@ -34,6 +53,32 @@
         </span>
       </div>
 
+      <!-- 当前扫描目录提示 -->
+      <div v-if="selectedFolderNames.length > 0" class="scan-scope-hint">
+        <el-icon><FolderOpened /></el-icon>
+        <span>当前扫描目录：</span>
+        <template v-if="selectedFolderNames.length <= 3">
+          <el-tag
+            v-for="name in selectedFolderNames"
+            :key="name"
+            size="small"
+            type="info"
+            style="margin-right: 4px"
+          >{{ name }}</el-tag>
+        </template>
+        <template v-else>
+          <el-tag
+            v-for="name in selectedFolderNames.slice(0, 3)"
+            :key="name"
+            size="small"
+            type="info"
+            style="margin-right: 4px"
+          >{{ name }}</el-tag>
+          <span class="scope-more">等 {{ selectedFolderNames.length }} 个目录</span>
+        </template>
+        <el-button link size="small" @click="scanStore.setSelectedFolders([], [])" style="margin-left: 4px">清除</el-button>
+      </div>
+
       <!-- 扫描/删除进度 -->
       <ProgressPanel
         v-if="showProgress"
@@ -42,6 +87,9 @@
         :progress="currentProgress"
         :result="operationResult"
         :error="progressError"
+        :elapsed-seconds="elapsedSeconds"
+        :completed="scanCompleted"
+        :completed-fetched-count="completedFetchedCount"
         style="margin-bottom: 12px"
       />
 
@@ -50,7 +98,9 @@
         v-if="filteredGroups.length > 0 || scanStore.groups.length > 0"
         :total-groups="stats.totalGroups.value"
         :total-files="stats.totalFiles.value"
+        :deletable-files="stats.deletableFiles.value"
         :total-size-bytes="stats.totalSizeBytes.value"
+        :scanned-file-count="scanStore.scannedFileCount || undefined"
         :selected-count="stats.selectedCount.value"
         :selected-size-bytes="stats.selectedSizeBytes.value"
         style="margin-bottom: 12px"
@@ -105,6 +155,13 @@
       />
     </el-main>
 
+    <!-- 目录选择弹窗 -->
+    <FolderTreeDialog
+      v-model:visible="showFolderDialog"
+      :session-id="authStore.sessionId ?? undefined"
+      @confirm="handleFolderConfirm"
+    />
+
     <!-- 确认弹窗 -->
     <DeleteConfirmDialog
       v-model:visible="showTrashDialog"
@@ -126,9 +183,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { Files, VideoPause, VideoPlay } from '@element-plus/icons-vue'
+import { Files, VideoPause, VideoPlay, Folder, FolderOpened, Refresh, Delete } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 import { useAuthStore } from '@/stores/auth'
 import { useScanStore } from '@/stores/scan'
@@ -137,7 +195,7 @@ import { useSSE } from '@/composables/useSSE'
 import { useFileFilter } from '@/composables/useFileFilter'
 import { useSelection } from '@/composables/useSelection'
 import { useStats } from '@/composables/useStats'
-import { startScan, startDelete, logout, pauseScan, resumeScan, stopScan } from '@/api'
+import { startScan, startDelete, logout, pauseScan, resumeScan, stopScan, clearScanCache } from '@/api'
 
 import ProgressPanel from '@/components/ProgressPanel.vue'
 import StatsSummary from '@/components/StatsSummary.vue'
@@ -146,6 +204,7 @@ import DuplicateGroupList from '@/components/DuplicateGroupList.vue'
 import SelectionToolbar from '@/components/SelectionToolbar.vue'
 import DeleteConfirmDialog from '@/components/DeleteConfirmDialog.vue'
 import PermanentDeleteDialog from '@/components/PermanentDeleteDialog.vue'
+import FolderTreeDialog from '@/components/FolderTreeDialog.vue'
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -178,6 +237,50 @@ const progressError = ref<string | null>(null)
 const isDeleting = ref(false)
 const showTrashDialog = ref(false)
 const showPermanentDialog = ref(false)
+
+// ── Elapsed timer ─────────────────────────────────────────────────────────────
+const elapsedSeconds = ref(0)
+const scanCompleted = ref(false)
+const completedFetchedCount = ref(0)
+let elapsedTimer: ReturnType<typeof setInterval> | null = null
+// Unix timestamp (seconds) when the current scan started, persisted across refreshes
+let scanStartTime = 0
+
+function startElapsedTimer(resumeFromSeconds = 0) {
+  stopElapsedTimer()
+  elapsedSeconds.value = resumeFromSeconds
+  scanCompleted.value = false
+  scanStartTime = Math.floor(Date.now() / 1000) - resumeFromSeconds
+  sessionStorage.setItem('scan_start_time', String(scanStartTime))
+  elapsedTimer = setInterval(() => {
+    elapsedSeconds.value = Math.floor(Date.now() / 1000) - scanStartTime
+  }, 1000)
+}
+
+function stopElapsedTimer() {
+  if (elapsedTimer !== null) {
+    clearInterval(elapsedTimer)
+    elapsedTimer = null
+  }
+}
+
+function markScanComplete() {
+  stopElapsedTimer()
+  scanCompleted.value = true
+  sessionStorage.removeItem('scan_start_time')
+  // Keep the progress panel visible — user can see elapsed time until next scan
+}
+
+// ── Folder selection ──────────────────────────────────────────────────────────
+const showFolderDialog = ref(false)
+const selectedFolderIds = computed({
+  get: () => scanStore.selectedFolderIds,
+  set: (v: string[]) => scanStore.setSelectedFolders(v, scanStore.selectedFolderNames),
+})
+const selectedFolderNames = computed({
+  get: () => scanStore.selectedFolderNames,
+  set: (v: string[]) => scanStore.setSelectedFolders(scanStore.selectedFolderIds, v),
+})
 
 // ── Pagination ────────────────────────────────────────────────────────────────
 const pageSize = ref(20)
@@ -239,24 +342,25 @@ function makeScanHandlers() {
     },
     complete(data: any) {
       disconnectSSE()
+      completedFetchedCount.value = data.scanned_file_count ?? data.total_count ?? (currentProgress.value?.fetched_count ?? 0)
+      markScanComplete()
       const groups = data.groups ?? []
-      // Persist result so subsequent refreshes can restore it without SSE
       scanStore.persistResult(groups)
-      // Clear partial cache — final result supersedes it
+      scanStore.setScannedFileCount(data.scanned_file_count ?? data.total_count ?? 0)
       sessionStorage.removeItem('scan_partial')
-      // Keep taskId in sessionStorage cleared — result is now the source of truth
       scanStore.setTaskId(null)
       scanStore.setScanning(false)
       currentProgress.value = {
         percentage: 100,
-        fetched_count: data.total_count ?? 0,
-        total_count: data.total_count ?? null,
+        fetched_count: data.scanned_file_count ?? data.total_count ?? 0,
+        total_count: data.scanned_file_count ?? data.total_count ?? null,
       }
-      showProgress.value = false
+      // showProgress stays true — markScanComplete will hide it after 4s
       autoSelectDuplicates(groups)
     },
     error(data: any) {
       disconnectSSE()
+      stopElapsedTimer()
       const msg = data.message ?? '扫描失败'
       progressError.value = msg
       scanStore.setError(msg)
@@ -266,17 +370,20 @@ function makeScanHandlers() {
     stopped(data: any) {
       // User stopped the scan early — treat partial result as final
       disconnectSSE()
+      completedFetchedCount.value = data.scanned_file_count ?? data.fetched_count ?? (currentProgress.value?.fetched_count ?? 0)
+      markScanComplete()
       const groups = data.groups ?? []
       scanStore.persistResult(groups)
+      scanStore.setScannedFileCount(data.scanned_file_count ?? data.fetched_count ?? 0)
       sessionStorage.removeItem('scan_partial')
       scanStore.setTaskId(null)
       scanStore.setScanning(false)
       currentProgress.value = {
         percentage: 100,
-        fetched_count: data.fetched_count ?? 0,
-        total_count: data.fetched_count ?? null,
+        fetched_count: data.scanned_file_count ?? data.fetched_count ?? 0,
+        total_count: data.scanned_file_count ?? data.fetched_count ?? null,
       }
-      showProgress.value = false
+      // showProgress stays true — markScanComplete will hide it after 4s
       autoSelectDuplicates(groups)
     },
   }
@@ -305,6 +412,8 @@ onMounted(async () => {
     // Restore taskId to store so pause/stop buttons are visible
     scanStore.setTaskId(persistedTaskId)
     scanStore.setScanning(true)
+    // Restore selected folders
+    scanStore.restoreSelectedFolders()
     // Restore persisted progress so fetched_count shows correctly after refresh
     scanStore.restoreProgress()
     progressMode.value = 'scan'
@@ -316,6 +425,13 @@ onMounted(async () => {
     }
     operationResult.value = null
     progressError.value = null
+    scanCompleted.value = false
+    // Restore elapsed time from persisted start timestamp so timer doesn't reset on refresh
+    const persistedStartTime = sessionStorage.getItem('scan_start_time')
+    const resumeSeconds = persistedStartTime
+      ? Math.max(0, Math.floor(Date.now() / 1000) - parseInt(persistedStartTime, 10))
+      : 0
+    startElapsedTimer(resumeSeconds)
 
     // Immediately restore any partial results from the previous session
     // so the list isn't empty while waiting for the next SSE progress event.
@@ -366,6 +482,8 @@ onMounted(async () => {
 
   // 2. No in-progress task — restore last completed scan result if available
   console.log('[ScanView] no persisted task, trying restoreResult')
+  // Restore selected folders regardless of scan state
+  scanStore.restoreSelectedFolders()
   if (scanStore.groups.length === 0) {
     const restored = scanStore.restoreResult()
     console.log('[ScanView] restoreResult:', restored, 'groups:', scanStore.groups.length)
@@ -373,6 +491,11 @@ onMounted(async () => {
       autoSelectDuplicates(scanStore.groups)
     }
   }
+})
+
+// ── Cleanup ───────────────────────────────────────────────────────────────────
+onUnmounted(() => {
+  stopElapsedTimer()
 })
 
 // ── Logout ────────────────────────────────────────────────────────────────────
@@ -421,6 +544,7 @@ async function handleStop() {
   scanStore.setPaused(false)
   scanStore.setTaskId(null)
   showProgress.value = false
+  stopElapsedTimer()
   try {
     await stopScan(taskId)
     // The 'stopped' SSE event will arrive shortly and update groups/results.
@@ -432,13 +556,22 @@ async function handleStop() {
 }
 
 // ── Scan ──────────────────────────────────────────────────────────────────────
-async function handleScan() {
+async function handleScan(incremental = false) {
   if (scanStore.isScanning) return
+
+  // Preserve selected folders before reset clears them
+  const folderIds = [...scanStore.selectedFolderIds]
+  const folderNames = [...scanStore.selectedFolderNames]
 
   // Clear previous results
   scanStore.reset()
   selectionStore.clear()
   currentPage.value = 1
+
+  // Restore folder selection after reset
+  if (folderIds.length > 0) {
+    scanStore.setSelectedFolders(folderIds, folderNames)
+  }
 
   scanStore.setScanning(true)
   scanStore.setError(null)
@@ -447,14 +580,25 @@ async function handleScan() {
   currentProgress.value = { percentage: 0, fetched_count: 0, total_count: null }
   operationResult.value = null
   progressError.value = null
+  scanCompleted.value = false
+  completedFetchedCount.value = 0
+
+  // Start elapsed timer
+  startElapsedTimer()
 
   try {
-    const res = await startScan(authStore.sessionId ?? undefined)
+    const res = await startScan(
+      authStore.sessionId ?? undefined,
+      folderIds.length > 0 ? folderIds : undefined,
+      incremental,
+      folderNames.length > 0 ? folderNames : undefined,
+    )
     const taskId = res.data.task_id
     scanStore.setTaskId(taskId)
 
     connectSSE(`/api/scan/progress/${taskId}`, makeScanHandlers())
   } catch (err: any) {
+    stopElapsedTimer()
     const msg = err?.response?.data?.detail ?? '启动扫描失败'
     progressError.value = msg
     scanStore.setError(msg)
@@ -462,6 +606,33 @@ async function handleScan() {
   }
 }
 
+// ── Folder selection handler ──────────────────────────────────────────────────
+function handleFolderConfirm(ids: string[], names: string[]) {
+  scanStore.setSelectedFolders(ids, names)
+}
+
+// ── Clear scan cache ──────────────────────────────────────────────────────────
+async function handleClearScanCache() {
+  try {
+    await ElMessageBox.confirm(
+      '清除后，下次增量扫描将退化为全量扫描，重新遍历所有目录。确认清除？',
+      '清除扫描缓存',
+      {
+        confirmButtonText: '确认清除',
+        cancelButtonText: '取消',
+        type: 'warning',
+      },
+    )
+  } catch {
+    return // user cancelled
+  }
+  try {
+    const res = await clearScanCache(authStore.sessionId ?? undefined)
+    ElMessage.success(`已清除扫描缓存（共 ${res.data.deleted_count} 条记录）`)
+  } catch {
+    ElMessage.error('清除失败，请重试')
+  }
+}
 // ── Delete ────────────────────────────────────────────────────────────────────
 async function handleDelete(type: 'trash' | 'permanent') {
   const fileIds = selectionStore.selectedIdsArray
@@ -471,7 +642,12 @@ async function handleDelete(type: 'trash' | 'permanent') {
   const fileMeta = scanStore.groups
     .flatMap(g => g.files)
     .filter(f => fileIds.includes(f.file_id))
-    .map(f => ({ file_id: f.file_id, file_name: f.file_name, file_size: f.file_size }))
+    .map(f => ({
+      file_id: f.file_id,
+      file_name: f.file_name,
+      file_path: f.file_path ?? '',
+      file_size: f.file_size,
+    }))
 
   isDeleting.value = true
   progressMode.value = 'delete'
@@ -601,6 +777,27 @@ async function handleDelete(type: 'trash' | 'permanent') {
 }
 
 .scan-hint {
+  font-size: 13px;
+  color: #909399;
+}
+
+.scan-scope-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #606266;
+  margin-top: -8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.scan-scope-hint .el-icon {
+  color: #e6a23c;
+  flex-shrink: 0;
+}
+
+.scope-more {
   font-size: 13px;
   color: #909399;
 }

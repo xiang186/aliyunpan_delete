@@ -58,6 +58,7 @@ class ScanResult(BaseModel):
     total_groups: int
     total_files: int
     total_size_bytes: int
+    scanned_file_count: int = 0  # total files traversed during scan
     groups: list[DuplicateGroup]
 
 

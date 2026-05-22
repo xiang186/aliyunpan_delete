@@ -98,6 +98,55 @@ class AliyunDriveClient:
             payload["marker"] = marker
         return await self._request("POST", url, access_token, json=payload)
 
+    async def list_folders(
+        self,
+        access_token: str,
+        drive_id: str,
+        parent_file_id: str = "root",
+    ) -> list[dict]:
+        """
+        List only folders in a directory (all pages).
+
+        Returns a list of dicts with keys: file_id, name, has_children.
+        """
+        url = f"{_API_HOST}/adrive/v3/file/list"
+        folders: list[dict] = []
+        marker: str | None = None
+
+        while True:
+            payload: dict[str, Any] = {
+                "drive_id": drive_id,
+                "parent_file_id": parent_file_id,
+                "limit": 200,
+                "all": False,
+                "type": "folder",
+                "order_by": "name",
+                "order_direction": "ASC",
+            }
+            if marker:
+                payload["marker"] = marker
+
+            data = await self._request("POST", url, access_token, json=payload)
+            items: list[dict] = data.get("items", [])
+
+            for item in items:
+                if item.get("type") == "folder":
+                    folders.append({
+                        "file_id": item.get("file_id", ""),
+                        "name": item.get("name", ""),
+                        # has_children is not always returned; default to True so
+                        # the tree node shows an expand arrow (lazy load will
+                        # confirm whether there are actual children).
+                        "has_children": True,
+                    })
+
+            next_marker: str | None = data.get("next_marker") or None
+            if not next_marker:
+                break
+            marker = next_marker
+
+        return folders
+
     # ------------------------------------------------------------------
     # Batch operations
     # ------------------------------------------------------------------

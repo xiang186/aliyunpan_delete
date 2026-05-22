@@ -2,16 +2,24 @@
   <div v-if="isActive" class="progress-panel">
     <!-- 扫描进度 -->
     <template v-if="mode === 'scan'">
-      <div class="panel-title">正在扫描重复文件...</div>
+      <div v-if="completed" class="panel-title completed-title">
+        <el-icon style="color: #67c23a; margin-right: 4px"><CircleCheck /></el-icon>
+        扫描完成
+        <span v-if="elapsedSeconds !== undefined" class="elapsed-final">
+          用时 {{ formatElapsed(elapsedSeconds) }}，共获取 {{ completedFetchedCount }} 个文件
+        </span>
+      </div>
+      <div v-else class="panel-title">正在扫描重复文件...</div>
       <el-progress
-        :percentage="progress?.percentage ?? 0"
-        :status="error ? 'exception' : undefined"
-        :striped="!error"
-        :striped-flow="!error"
+        :percentage="completed ? 100 : (progress?.percentage ?? 0)"
+        :status="error ? 'exception' : (completed ? 'success' : undefined)"
+        :striped="!error && !completed"
+        :striped-flow="!error && !completed"
       />
-      <div class="progress-info">
+      <div v-if="!completed" class="progress-info">
         已获取 {{ progress?.fetched_count ?? 0 }} 个文件
         <span v-if="progress?.total_count">/ {{ progress.total_count }}</span>
+        <span v-if="elapsedSeconds !== undefined && elapsedSeconds > 0" class="elapsed-time">　已用时：{{ formatElapsed(elapsedSeconds) }}</span>
       </div>
     </template>
 
@@ -31,7 +39,7 @@
     <!-- 错误 -->
     <el-alert v-if="error" type="error" :title="error" :closable="false" show-icon style="margin-top: 8px" />
 
-    <!-- 完成结果摘要 -->
+    <!-- 完成结果摘要（删除操作） -->
     <div v-if="result" class="result-summary">
       <el-alert type="success" :closable="false" show-icon style="margin-bottom: 8px">
         操作完成：成功 {{ result.success_count }} 个，失败 {{ result.failed_count }} 个，
@@ -51,6 +59,8 @@
 </template>
 
 <script setup lang="ts">
+import { CircleCheck } from '@element-plus/icons-vue'
+
 const props = defineProps<{
   isActive: boolean
   mode: 'scan' | 'delete'
@@ -69,7 +79,19 @@ const props = defineProps<{
     failed_files?: Array<{ file_id: string; error_msg: string }>
   } | null
   error: string | null
+  elapsedSeconds?: number
+  completed?: boolean
+  completedFetchedCount?: number
 }>()
+
+function formatElapsed(seconds: number): string {
+  const mins = Math.floor(seconds / 60)
+  const secs = seconds % 60
+  if (mins > 0) {
+    return `${mins}分${String(secs).padStart(2, '0')}秒`
+  }
+  return `${secs}秒`
+}
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B'
@@ -81,8 +103,11 @@ function formatBytes(bytes: number): string {
 
 <style scoped>
 .progress-panel { padding: 16px; background: #fff; border: 1px solid #e4e7ed; border-radius: 6px; }
-.panel-title { font-size: 14px; font-weight: 500; margin-bottom: 10px; color: #303133; }
+.panel-title { font-size: 14px; font-weight: 500; margin-bottom: 10px; color: #303133; display: flex; align-items: center; }
+.completed-title { color: #67c23a; }
+.elapsed-final { font-size: 13px; color: #909399; font-weight: 400; margin-left: 8px; }
 .progress-info { font-size: 13px; color: #606266; margin-top: 6px; }
+.elapsed-time { color: #909399; }
 .result-summary { margin-top: 12px; }
 .failed-files { margin-top: 8px; }
 .failed-title { font-size: 13px; color: #f56c6c; margin-bottom: 4px; }

@@ -5,6 +5,8 @@
 ## 功能特性
 
 - **扫描重复文件**：递归遍历整个云盘，按文件内容哈希（SHA1）和大小识别重复文件
+- **指定目录扫描**：支持选择特定文件夹进行扫描，无需扫描整个云盘
+- **增量扫描**：跳过未变更目录，加速二次扫描
 - **实时进度**：扫描过程中实时显示已发现的重复文件列表，无需等待扫描完成
 - **暂停 / 继续 / 停止**：扫描过程中可随时暂停或停止，使用已扫描出的结果进行删除
 - **批量删除**：支持移至回收站（可恢复）和永久删除两种方式
@@ -15,6 +17,7 @@
 - **历史记录**：查看所有删除任务的详细记录，包含每个文件的操作结果
 - **刷新恢复**：页面刷新后自动恢复扫描进度和已发现的文件列表
 - **QR 码登录**：扫描二维码登录阿里云盘，无需输入账号密码
+- **文件夹搜索**：支持关键词搜索全量文件夹，快速定位目标目录
 
 ## 技术栈
 
@@ -79,7 +82,7 @@ python -m venv .venv
 # source .venv/bin/activate  # macOS/Linux
 
 # 安装依赖
-pip install -e .
+pip install -e ".[dev]"
 
 # 配置环境变量
 cp ../.env.example .env
@@ -112,6 +115,8 @@ npm run dev
 | `ENCRYPTION_KEY` | ✅ | — | Fernet 对称加密密钥，用于加密存储 Token |
 | `DATABASE_URL` | — | `sqlite:///./data/app.db` | SQLite 数据库路径 |
 | `API_CALL_INTERVAL_MS` | — | `200` | API 调用间隔（毫秒），避免触发限流 |
+| `API_MAX_RETRIES` | — | `5` | API 限流时最大重试次数 |
+| `API_MAX_BACKOFF_SECONDS` | — | `60` | 指数退避最大等待时间（秒） |
 | `CORS_ORIGINS` | — | `["http://localhost:5173","http://localhost:80"]` | 允许跨域的前端地址 |
 | `OAUTH_REDIRECT_URI` | — | `http://localhost:8000/api/auth/callback` | OAuth 回调地址 |
 
@@ -129,10 +134,12 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 ### 扫描重复文件
 
-1. 点击「扫描重复文件」按钮开始扫描
-2. 扫描过程中实时显示已发现的重复文件组
-3. 可点击「暂停」暂停扫描，点击「继续」恢复
-4. 点击「停止并使用当前结果」可提前结束扫描，使用已发现的结果
+1. 点击「扫描重复文件」按钮开始扫描（默认全盘扫描）
+2. 可选择指定目录扫描：在文件夹选择器中搜索或浏览目标目录
+3. 勾选「增量扫描」可跳过未变更目录，加速二次扫描
+4. 扫描过程中实时显示已发现的重复文件组
+5. 可点击「暂停」暂停扫描，点击「继续」恢复
+6. 点击「停止并使用当前结果」可提前结束扫描，使用已发现的结果
 
 ### 删除文件
 
@@ -156,10 +163,10 @@ aliyun/
 │   │   ├── core/             # 工具（加密、文件类型、限流）
 │   │   ├── db/               # 数据库模型和仓库
 │   │   ├── models/           # Pydantic 数据模型
-│   │   ├── services/         # 业务逻辑（扫描、删除、阿里云客户端）
+│   │   ├── services/         # 业务逻辑（扫描、删除、文件夹索引、阿里云客户端）
 │   │   ├── config.py         # 配置管理
 │   │   └── main.py           # FastAPI 应用入口
-│   ├── tests/                # 单元测试
+│   ├── tests/                # 单元测试（pytest + hypothesis）
 │   └── pyproject.toml
 ├── frontend/                 # Vue 3 前端
 │   ├── src/
@@ -169,7 +176,7 @@ aliyun/
 │   │   ├── router/           # 路由配置
 │   │   ├── stores/           # Pinia 状态管理
 │   │   ├── types/            # TypeScript 类型定义
-│   │   └── views/            # 页面视图
+│   │   └── views/            # 页面视图（Login、Scan、History）
 │   └── package.json
 ├── docker-compose.yml
 └── .env.example
@@ -183,15 +190,36 @@ aliyun/
 | `POST` | `/api/auth/qrcode/poll` | 轮询二维码扫描状态 |
 | `GET` | `/api/auth/status` | 获取当前登录状态 |
 | `POST` | `/api/auth/logout` | 退出登录 |
-| `POST` | `/api/scan/start` | 开始扫描重复文件 |
+| `POST` | `/api/scan/start` | 开始扫描重复文件（支持指定目录和增量模式） |
 | `GET` | `/api/scan/progress/{task_id}` | SSE 流：扫描进度 |
 | `POST` | `/api/scan/pause/{task_id}` | 暂停扫描 |
 | `POST` | `/api/scan/resume/{task_id}` | 继续扫描 |
 | `POST` | `/api/scan/stop/{task_id}` | 停止扫描并返回当前结果 |
+| `GET` | `/api/scan/folders` | 列出指定目录的子文件夹（懒加载树） |
+| `GET` | `/api/scan/folder-index/status` | 获取文件夹索引构建状态 |
+| `POST` | `/api/scan/folder-index/build` | 触发后台全量文件夹索引构建 |
+| `GET` | `/api/scan/folder-index/search` | 按关键词搜索文件夹 |
 | `POST` | `/api/delete/start` | 开始批量删除 |
 | `GET` | `/api/delete/progress/{task_id}` | SSE 流：删除进度 |
 | `GET` | `/api/tasks` | 获取删除任务历史列表 |
 | `GET` | `/api/tasks/{task_id}` | 获取任务详情及文件列表 |
+| `GET` | `/health` | 健康检查 |
+
+## 测试
+
+**后端**（pytest + hypothesis 属性测试）
+
+```bash
+cd backend
+pytest
+```
+
+**前端**（vitest）
+
+```bash
+cd frontend
+npm test
+```
 
 ## 注意事项
 
@@ -199,6 +227,7 @@ aliyun/
 - 后端使用内存存储扫描任务状态，**重启后端服务会导致进行中的扫描任务丢失**
 - 扫描大量文件时建议使用暂停功能分批处理，避免一次性等待时间过长
 - 阿里云盘 API 有调用频率限制，`API_CALL_INTERVAL_MS` 建议不低于 200ms
+- 文件夹索引（全量搜索）需要先触发构建，首次构建时间取决于云盘目录数量
 
 ## License
 
