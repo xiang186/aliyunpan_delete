@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 # In-memory flag to prevent duplicate background builds per user
 _building: set[str] = set()
 
+# Share the same concurrency control with scan service
+from app.services.scan_service import _MAX_CONCURRENT_API_TASKS, _current_api_tasks, _api_tasks_lock
+
 
 class FolderIndexService:
     def __init__(self, aliyun_client: AliyunDriveClient) -> None:
@@ -141,6 +144,13 @@ class FolderIndexService:
     # Background crawl
     # ------------------------------------------------------------------
 
+    async def _get_access_token(self, session_id: str) -> str:
+        """Fetch a valid access token from the database (refreshes if near expiry)."""
+        from app.config import settings
+        async with AsyncSessionLocal() as db:
+            auth_service = AuthService(db, settings, self._client)
+            return await auth_service.get_valid_access_token(session_id)
+
     async def _crawl(self, session_id: str, user_id: str, drive_id: str) -> None:
         total = 0
         try:
@@ -151,6 +161,10 @@ class FolderIndexService:
                 )
                 await db.commit()
 
+            # Fetch the access token once at the start of the crawl.
+            # _crawl_recursive will refresh it automatically on 401.
+            access_token = await self._get_access_token(session_id)
+
             buffer: list[dict] = []
             await self._crawl_recursive(
                 session_id=session_id,
@@ -160,6 +174,7 @@ class FolderIndexService:
                 parent_path="",
                 buffer=buffer,
                 total_ref=[0],
+                access_token=access_token,
             )
             total = buffer.__len__()  # already flushed; use total_ref
             # Flush any remaining rows
@@ -196,63 +211,87 @@ class FolderIndexService:
         parent_path: str,
         buffer: list[dict],
         total_ref: list[int],
-    ) -> None:
-        from app.config import settings
+        access_token: str,
+    ) -> str:
+        """
+        Recursively crawl folders under *parent_id*.
 
-        marker: str | None = None
+        Returns the (possibly refreshed) access token so callers can propagate
+        the latest token back up the call stack.
+        """
+        import httpx
 
-        while True:
-            async with AsyncSessionLocal() as db:
-                auth_service = AuthService(db, settings, self._client)
-                access_token = await auth_service.get_valid_access_token(session_id)
-
-            try:
-                page = await self._client.list_folders(
-                    access_token=access_token,
-                    drive_id=drive_id,
-                    parent_file_id=parent_id,
+        try:
+            page = await self._client.list_folders(
+                access_token=access_token,
+                drive_id=drive_id,
+                parent_file_id=parent_id,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 401:
+                # Access token expired mid-crawl — refresh once and retry.
+                logger.info(
+                    "Folder index: access token expired listing %s, refreshing…",
+                    parent_id,
                 )
-            except Exception as exc:
+                access_token = await self._get_access_token(session_id)
+                try:
+                    page = await self._client.list_folders(
+                        access_token=access_token,
+                        drive_id=drive_id,
+                        parent_file_id=parent_id,
+                    )
+                except Exception as retry_exc:
+                    logger.warning(
+                        "Folder index: failed to list %s after token refresh: %s",
+                        parent_id, retry_exc,
+                    )
+                    return access_token
+            else:
                 logger.warning(
                     "Folder index: failed to list %s: %s", parent_id, exc
                 )
-                return
+                return access_token
+        except Exception as exc:
+            logger.warning(
+                "Folder index: failed to list %s: %s", parent_id, exc
+            )
+            return access_token
 
-            for item in page:
-                folder_path = (
-                    f"{parent_path}/{item['name']}" if parent_path else item["name"]
-                )
-                buffer.append(
-                    {
-                        "file_id": item["file_id"],
-                        "name": item["name"],
-                        "parent_id": parent_id,
-                        "full_path": folder_path,
-                        "has_children": 1 if item.get("has_children", True) else 0,
-                    }
-                )
-                total_ref[0] += 1
+        for item in page:
+            folder_path = (
+                f"{parent_path}/{item['name']}" if parent_path else item["name"]
+            )
+            buffer.append(
+                {
+                    "file_id": item["file_id"],
+                    "name": item["name"],
+                    "parent_id": parent_id,
+                    "full_path": folder_path,
+                    "has_children": 1 if item.get("has_children", True) else 0,
+                }
+            )
+            total_ref[0] += 1
 
-                # Flush every 200 rows to avoid large memory usage
-                if len(buffer) >= 200:
-                    await self._flush(user_id, buffer)
-                    buffer.clear()
+            # Flush every 200 rows to avoid large memory usage
+            if len(buffer) >= 200:
+                await self._flush(user_id, buffer)
+                buffer.clear()
 
-                # Recurse into sub-folders
-                await self._crawl_recursive(
-                    session_id=session_id,
-                    user_id=user_id,
-                    drive_id=drive_id,
-                    parent_id=item["file_id"],
-                    parent_path=folder_path,
-                    buffer=buffer,
-                    total_ref=total_ref,
-                )
-                await asyncio.sleep(0.05)
+            # Recurse into sub-folders; propagate the latest token back up.
+            access_token = await self._crawl_recursive(
+                session_id=session_id,
+                user_id=user_id,
+                drive_id=drive_id,
+                parent_id=item["file_id"],
+                parent_path=folder_path,
+                buffer=buffer,
+                total_ref=total_ref,
+                access_token=access_token,
+            )
+            await asyncio.sleep(0.05)
 
-            # list_folders already handles pagination internally, so one call
-            # returns all children — no next_marker loop needed here.
-            break
+        return access_token
 
     async def _flush(self, user_id: str, rows: list[dict]) -> None:
         """Bulk-upsert a batch of folder rows."""

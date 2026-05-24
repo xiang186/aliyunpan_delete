@@ -244,7 +244,15 @@ class AliyunDriveClient:
             if access_token:
                 headers["Authorization"] = f"Bearer {access_token}"
 
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            # Use timeout settings from rate limiter config
+            timeout = httpx.Timeout(
+                connect=self._rate_limiter.config.connect_timeout,
+                read=self._rate_limiter.config.read_timeout,
+                write=self._rate_limiter.config.write_timeout,
+                pool=self._rate_limiter.config.pool_timeout,
+            )
+            
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.request(method, url, headers=headers, **kwargs)
                 response.raise_for_status()
                 return response.json()

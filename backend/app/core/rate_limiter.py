@@ -3,7 +3,7 @@ API rate limiter with interval control and exponential backoff retry.
 """
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Coroutine
 
 import httpx
@@ -18,6 +18,10 @@ class RateLimitConfig:
     interval_ms: int = 200          # Minimum milliseconds between API calls
     max_retries: int = 5            # Maximum number of retries on 429
     max_backoff_seconds: int = 60   # Upper bound for exponential backoff wait
+    connect_timeout: float = 10.0   # Connection timeout in seconds
+    read_timeout: float = 30.0      # Read timeout in seconds
+    write_timeout: float = 30.0     # Write timeout in seconds
+    pool_timeout: float = 10.0      # Pool timeout in seconds
 
 
 class RateLimiter:
@@ -40,6 +44,7 @@ class RateLimiter:
 
         - Waits `interval_ms` milliseconds before each call.
         - On HTTP 429, retries up to `max_retries` times with exponential backoff.
+        - On connection errors, retries up to `max_retries` times with exponential backoff.
         - Re-raises the last exception if all retries are exhausted.
         """
         # Pre-call interval to avoid bursting
@@ -68,6 +73,25 @@ class RateLimiter:
                         )
                         raise
                 else:
+                    raise
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+                # Handle connection-related errors with exponential backoff
+                last_exc = exc
+                if attempt < self.config.max_retries:
+                    wait = self._exponential_backoff(attempt)
+                    logger.warning(
+                        "Connection failed (%s). Attempt %d/%d. Waiting %.1fs before retry.",
+                        exc.__class__.__name__,
+                        attempt + 1,
+                        self.config.max_retries,
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(
+                        "Connection retries exhausted after %d attempts.",
+                        self.config.max_retries,
+                    )
                     raise
 
         # Should not reach here, but satisfy type checker

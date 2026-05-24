@@ -42,6 +42,11 @@ _scan_running: dict[str, bool] = {}
 _scan_pause_events: dict[str, asyncio.Event] = {}
 _scan_stop_flags: dict[str, bool] = {}
 
+# Global concurrency control for API-intensive tasks
+_MAX_CONCURRENT_API_TASKS = 2  # Maximum concurrent API-intensive tasks
+_current_api_tasks: set[str] = set()  # Set of currently running API-intensive task IDs
+_api_tasks_lock = asyncio.Lock()  # Lock for managing concurrent tasks
+
 _PROGRESS_INTERVAL = 100
 
 
@@ -97,8 +102,23 @@ class ScanService:
         _scan_pause_events[task_id] = pause_event
         _scan_stop_flags[task_id] = False
 
+        # Wait for available slot if too many concurrent API tasks
+        async with _api_tasks_lock:
+            while len(_current_api_tasks) >= _MAX_CONCURRENT_API_TASKS:
+                logger.info(
+                    "Too many concurrent API tasks (%d/%d), waiting for slot...",
+                    len(_current_api_tasks), _MAX_CONCURRENT_API_TASKS
+                )
+                await asyncio.sleep(5.0)  # Wait 5 seconds before checking again
+            
+            _current_api_tasks.add(task_id)
+            logger.info(
+                "Scan task %s started (concurrent tasks: %d/%d)",
+                task_id, len(_current_api_tasks), _MAX_CONCURRENT_API_TASKS
+            )
+
         asyncio.create_task(
-            self._run_scan(
+            self._run_scan_with_cleanup(
                 session_id, task_id,
                 folder_ids=folder_ids,
                 folder_names=folder_names,
@@ -173,6 +193,15 @@ class ScanService:
     # Background orchestration
     # ------------------------------------------------------------------
 
+    async def _refresh_token(self, session_id: str) -> str:
+        """Fetch a valid access token from the database (refreshes if near expiry)."""
+        from app.config import settings
+        from app.db.database import AsyncSessionLocal
+        from app.services.auth_service import AuthService as _AuthService
+        async with AsyncSessionLocal() as db:
+            auth_service = _AuthService(db, settings, self._client)
+            return await auth_service.get_valid_access_token(session_id)
+
     async def _run_scan(
         self,
         session_id: str,
@@ -231,6 +260,7 @@ class ScanService:
                     folder_ids=folder_ids,
                     folder_names=folder_names,
                     broadcast=broadcast,
+                    access_token=access_token,
                 )
             else:
                 groups, stopped, scanned_file_count = await self._full_scan(
@@ -241,6 +271,7 @@ class ScanService:
                     folder_ids=folder_ids,
                     folder_names=folder_names,
                     broadcast=broadcast,
+                    access_token=access_token,
                 )
 
             total_files = sum(g.duplicate_count for g in groups)
@@ -301,6 +332,7 @@ class ScanService:
         folder_ids: list[str] | None,
         folder_names: list[str] | None,
         broadcast,
+        access_token: str,
     ) -> tuple[list[DuplicateGroup], bool, int]:
         """Returns (groups, stopped, scanned_file_count)."""
         all_files: list[dict] = []
@@ -320,9 +352,10 @@ class ScanService:
                 if stopped:
                     break
                 parent_path = name_map.get(folder_id, folder_id)
-                stopped = await self._traverse(
+                stopped, access_token = await self._traverse(
                     session_id=session_id,
                     task_id=task_id,
+                    user_id=user_id,
                     drive_id=drive_id,
                     parent_file_id=folder_id,
                     parent_path=parent_path,
@@ -331,11 +364,13 @@ class ScanService:
                     folder_parents=folder_parents,
                     broadcast=broadcast,
                     skip_folder_ids=root_set - {folder_id},
+                    access_token=access_token,
                 )
         else:
-            stopped = await self._traverse(
+            stopped, access_token = await self._traverse(
                 session_id=session_id,
                 task_id=task_id,
+                user_id=user_id,
                 drive_id=drive_id,
                 parent_file_id="root",
                 parent_path="",
@@ -343,14 +378,17 @@ class ScanService:
                 visited_folders=visited_folders,
                 folder_parents=folder_parents,
                 broadcast=broadcast,
+                access_token=access_token,
             )
 
         groups = self._build_duplicate_groups(all_files)
 
-        # Persist clean directories (no duplicate files) regardless of whether
-        # the scan completed or was stopped early.  This way incremental scan
-        # can skip them on the next run even after a partial scan.
-        if visited_folders:
+        # Leaf directories are persisted immediately during traversal.
+        # visited_folders now contains only non-leaf directories.
+        # Only persist non-leaf folder cache when the scan completed fully —
+        # a partial scan cannot reliably determine which non-leaf folders are
+        # clean because some of their subtrees may not have been visited.
+        if visited_folders and not stopped:
             dup_file_ids: set[str] = {
                 f.file_id for group in groups for f in group.files
             }
@@ -379,7 +417,7 @@ class ScanService:
                 await self._remove_scanned_folders(user_id, dirty_visited)
 
             logger.info(
-                "Scan task %s: saved %d clean folders, removed %d dirty folders for user %s",
+                "Scan task %s: saved %d clean non-leaf folders, removed %d dirty folders for user %s",
                 task_id, len(clean_folders), len(dirty_visited), user_id,
             )
 
@@ -398,6 +436,7 @@ class ScanService:
         folder_ids: list[str] | None,
         folder_names: list[str] | None,
         broadcast,
+        access_token: str,
     ) -> tuple[list[DuplicateGroup], bool, int]:
         """
         Walk the directory tree incrementally.  Returns (groups, stopped, scanned_file_count).
@@ -439,7 +478,7 @@ class ScanService:
                 if stopped:
                     break
                 parent_path = name_map.get(folder_id, folder_id)
-                stopped = await self._incremental_traverse(
+                stopped, access_token = await self._incremental_traverse(
                     session_id=session_id,
                     task_id=task_id,
                     drive_id=drive_id,
@@ -451,9 +490,10 @@ class ScanService:
                     folder_parents=folder_parents,
                     broadcast=broadcast,
                     skip_folder_ids=root_set - {folder_id},
+                    access_token=access_token,
                 )
         else:
-            stopped = await self._incremental_traverse(
+            stopped, access_token = await self._incremental_traverse(
                 session_id=session_id,
                 task_id=task_id,
                 drive_id=drive_id,
@@ -464,6 +504,7 @@ class ScanService:
                 updated_folders=updated_folders,
                 folder_parents=folder_parents,
                 broadcast=broadcast,
+                access_token=access_token,
             )
 
         groups = self._build_duplicate_groups(all_files)
@@ -516,7 +557,8 @@ class ScanService:
         folder_parents: dict[str, str],
         broadcast,
         skip_folder_ids: set[str] | None = None,
-    ) -> bool:
+        access_token: str = "",
+    ) -> tuple[bool, str]:
         """
         Recursively walk the tree for incremental scan.
 
@@ -524,26 +566,20 @@ class ScanService:
           - If its updated_at matches known[folder_id] → skip subtree entirely.
           - Otherwise → scan its files, recurse, record new updated_at.
 
-        Returns True if stopped early.
+        Returns (stopped, access_token) — the token may have been refreshed.
         """
-        from app.config import settings
-        from app.db.database import AsyncSessionLocal
-        from app.services.auth_service import AuthService as _AuthService
+        import httpx
 
         pause_event = _scan_pause_events.get(task_id)
         marker: str | None = None
 
         while True:
             if _scan_stop_flags.get(task_id):
-                return True
+                return True, access_token
             if pause_event:
                 await pause_event.wait()
                 if _scan_stop_flags.get(task_id):
-                    return True
-
-            async with AsyncSessionLocal() as db:
-                auth_service = _AuthService(db, settings, self._client)
-                access_token = await auth_service.get_valid_access_token(session_id)
+                    return True, access_token
 
             try:
                 page = await self._client.list_files(
@@ -553,6 +589,32 @@ class ScanService:
                     marker=marker,
                     limit=200,
                 )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 401:
+                    logger.info(
+                        "Scan task %s: access token expired listing %s, refreshing…",
+                        task_id, parent_file_id,
+                    )
+                    access_token = await self._refresh_token(session_id)
+                    try:
+                        page = await self._client.list_files(
+                            access_token=access_token,
+                            drive_id=drive_id,
+                            parent_file_id=parent_file_id,
+                            marker=marker,
+                            limit=200,
+                        )
+                    except Exception as retry_exc:
+                        logger.warning(
+                            "Scan task %s: failed to list %s after token refresh: %s",
+                            task_id, parent_file_id, retry_exc,
+                        )
+                        break
+                else:
+                    logger.warning(
+                        "Scan task %s: failed to list %s: %s", task_id, parent_file_id, exc
+                    )
+                    break
             except Exception as exc:
                 logger.warning(
                     "Scan task %s: failed to list %s: %s", task_id, parent_file_id, exc
@@ -563,7 +625,7 @@ class ScanService:
 
             for item in items:
                 if _scan_stop_flags.get(task_id):
-                    return True
+                    return True, access_token
 
                 if item.get("type") == "file":
                     item["_resolved_path"] = parent_path
@@ -604,7 +666,7 @@ class ScanService:
                         continue
 
                     # Changed or new — recurse
-                    stopped = await self._incremental_traverse(
+                    stopped, access_token = await self._incremental_traverse(
                         session_id=session_id,
                         task_id=task_id,
                         drive_id=drive_id,
@@ -616,9 +678,10 @@ class ScanService:
                         folder_parents=folder_parents,
                         broadcast=broadcast,
                         skip_folder_ids=skip_folder_ids,
+                        access_token=access_token,
                     )
                     if stopped:
-                        return True
+                        return True, access_token
 
                     # Record the new updated_at for this folder
                     if sub_updated_at:
@@ -632,7 +695,7 @@ class ScanService:
             marker = next_marker
             await asyncio.sleep(0.15)
 
-        return False
+        return False, access_token
 
     # ------------------------------------------------------------------
     # Full traversal (used by full scan)
@@ -642,6 +705,7 @@ class ScanService:
         self,
         session_id: str,
         task_id: str,
+        user_id: str,
         drive_id: str,
         parent_file_id: str,
         parent_path: str,
@@ -650,29 +714,37 @@ class ScanService:
         folder_parents: dict[str, str],
         broadcast,
         skip_folder_ids: set[str] | None = None,
-    ) -> bool:
+        access_token: str = "",
+    ) -> tuple[bool, str]:
         """
         Recursively list all files.  Collects visited folder updated_at values
-        into visited_folders for later persistence.  Returns True if stopped.
+        into visited_folders for later persistence.
+
+        Leaf directories (no sub-folders) are written to the scanned_folder
+        table immediately after they are fully traversed, so that progress is
+        preserved even if the backend process crashes mid-scan.  Non-leaf
+        directories are still collected in visited_folders and persisted in
+        bulk at the end of a complete scan.
+
+        Returns (stopped, access_token) — the token may have been refreshed.
         """
-        from app.config import settings
-        from app.db.database import AsyncSessionLocal
-        from app.services.auth_service import AuthService as _AuthService
+        import httpx
 
         pause_event = _scan_pause_events.get(task_id)
         marker: str | None = None
 
+        # Files collected directly inside this directory (not sub-dirs)
+        local_files: list[dict] = []
+        # updated_at values of sub-folders found in this directory
+        sub_folder_updated_ats: dict[str, str] = {}
+
         while True:
             if _scan_stop_flags.get(task_id):
-                return True
+                return True, access_token
             if pause_event:
                 await pause_event.wait()
                 if _scan_stop_flags.get(task_id):
-                    return True
-
-            async with AsyncSessionLocal() as db:
-                auth_service = _AuthService(db, settings, self._client)
-                access_token = await auth_service.get_valid_access_token(session_id)
+                    return True, access_token
 
             try:
                 page = await self._client.list_files(
@@ -682,6 +754,32 @@ class ScanService:
                     marker=marker,
                     limit=200,
                 )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 401:
+                    logger.info(
+                        "Scan task %s: access token expired listing %s, refreshing…",
+                        task_id, parent_file_id,
+                    )
+                    access_token = await self._refresh_token(session_id)
+                    try:
+                        page = await self._client.list_files(
+                            access_token=access_token,
+                            drive_id=drive_id,
+                            parent_file_id=parent_file_id,
+                            marker=marker,
+                            limit=200,
+                        )
+                    except Exception as retry_exc:
+                        logger.warning(
+                            "Scan task %s: failed to list %s after token refresh: %s",
+                            task_id, parent_file_id, retry_exc,
+                        )
+                        break
+                else:
+                    logger.warning(
+                        "Scan task %s: failed to list %s: %s", task_id, parent_file_id, exc
+                    )
+                    break
             except Exception as exc:
                 logger.warning(
                     "Scan task %s: failed to list %s: %s", task_id, parent_file_id, exc
@@ -692,11 +790,12 @@ class ScanService:
 
             for item in items:
                 if _scan_stop_flags.get(task_id):
-                    return True
+                    return True, access_token
 
                 if item.get("type") == "file":
                     item["_resolved_path"] = parent_path
                     all_files.append(item)
+                    local_files.append(item)
                     if len(all_files) % _PROGRESS_INTERVAL == 0:
                         partial_groups = ScanService._build_duplicate_groups(all_files)
                         await broadcast({
@@ -723,13 +822,18 @@ class ScanService:
                     # Record parent relationship for dirty-ancestor propagation
                     folder_parents[sub_id] = parent_file_id
 
+                    # Track sub-folders found in this directory
+                    if sub_updated_at:
+                        sub_folder_updated_ats[sub_id] = sub_updated_at
+
                     # Record this folder's updated_at for later persistence
                     if sub_updated_at:
                         visited_folders[sub_id] = sub_updated_at
 
-                    stopped = await self._traverse(
+                    stopped, access_token = await self._traverse(
                         session_id=session_id,
                         task_id=task_id,
+                        user_id=user_id,
                         drive_id=drive_id,
                         parent_file_id=sub_id,
                         parent_path=sub_path,
@@ -738,9 +842,10 @@ class ScanService:
                         folder_parents=folder_parents,
                         broadcast=broadcast,
                         skip_folder_ids=skip_folder_ids,
+                        access_token=access_token,
                     )
                     if stopped:
-                        return True
+                        return True, access_token
                     await asyncio.sleep(0.05)
 
             next_marker: str | None = page.get("next_marker") or None
@@ -749,7 +854,54 @@ class ScanService:
             marker = next_marker
             await asyncio.sleep(0.15)
 
-        return False
+        # After all pages of this directory are processed, check if it is a
+        # leaf directory (no sub-folders).  If so, we can immediately determine
+        # whether it is clean and persist the result to the database — this
+        # ensures progress is saved even if the backend crashes later.
+        #
+        # Note: we can only do this for leaf directories because non-leaf
+        # directories may have duplicate files spread across multiple subtrees,
+        # and we cannot know the full duplicate set until the entire scan
+        # completes.
+        is_leaf = len(sub_folder_updated_ats) == 0
+        if is_leaf and parent_file_id != "root":
+            # Check if any local file is a duplicate within this directory
+            local_hashes: dict[tuple, int] = {}
+            has_local_dup = False
+            for f in local_files:
+                content_hash = f.get("content_hash") or f.get("sha1") or ""
+                size = f.get("size", 0)
+                if not content_hash or not size:
+                    continue
+                key = (content_hash, size)
+                local_hashes[key] = local_hashes.get(key, 0) + 1
+                if local_hashes[key] >= 2:
+                    has_local_dup = True
+                    break
+
+            # Retrieve the updated_at for this directory from visited_folders
+            # (it was recorded by the parent call before recursing into us)
+            this_updated_at = visited_folders.get(parent_file_id, "")
+            if this_updated_at and not has_local_dup:
+                # Clean leaf directory — persist immediately
+                await self._save_scanned_folders(user_id, {parent_file_id: this_updated_at})
+                # Remove from visited_folders so the end-of-scan logic does
+                # not process it again
+                visited_folders.pop(parent_file_id, None)
+                logger.debug(
+                    "Scan task %s: persisted clean leaf folder %s immediately",
+                    task_id, parent_file_id,
+                )
+            elif this_updated_at and has_local_dup:
+                # Dirty leaf directory — remove any stale clean record
+                await self._remove_scanned_folders(user_id, {parent_file_id})
+                visited_folders.pop(parent_file_id, None)
+                logger.debug(
+                    "Scan task %s: removed dirty leaf folder %s from cache",
+                    task_id, parent_file_id,
+                )
+
+        return False, access_token
 
     # ------------------------------------------------------------------
     # scanned_folder persistence helpers

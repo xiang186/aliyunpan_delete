@@ -22,9 +22,15 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/app.db"
 
     # API rate limiting
-    api_call_interval_ms: int = 200  # milliseconds between API calls
+    api_call_interval_ms: int = 500  # milliseconds between API calls (increased from 200)
     api_max_retries: int = 5
     api_max_backoff_seconds: int = 60
+    
+    # API timeout settings
+    api_connect_timeout: float = 10.0   # Connection timeout in seconds
+    api_read_timeout: float = 30.0      # Read timeout in seconds
+    api_write_timeout: float = 30.0     # Write timeout in seconds
+    api_pool_timeout: float = 10.0      # Pool timeout in seconds
 
     # CORS origins allowed
     cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
